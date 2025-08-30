@@ -1,16 +1,16 @@
 /*
- * FloppyTool (ASL version) - v7
+ * FloppyTool (ASL version) - v7c
  * Layout:
  *   Row 1: Format | Copy | Verify | Quit
  *   Row 2: Read ADF | Write ADF | Verify ADF | About
  *
- * Changes in v7:
- *   - Removed the mid artwork area
- *   - Reduced window height
- *   - Added a 2–3 line ASCII banner between gadget rows and log
- *   - Progress bar kept compact and visible
- *
- * AmigaOS 2.0+ (v37), 68k
+ * Changes in v7c:
+ *   - Format now has 3 modalità:
+ *       • Quick (OS): C:Format ... QUICK
+ *       • Full (OS):  C:Format ...        (formattazione fisica via trackdisk + FS)
+ *       • Deep:       Pass RAW su tutte le tracce (zero) + C:Format QUICK per installare il FS
+ *   - Banner ASCII: "2025 - Danilo Savioni + Stella AI", testo nero senza ombra (JAM2)
+ *   - Finestra compatta come v7b (WIN_H = 248)
  */
 
 #include <exec/types.h>
@@ -32,6 +32,10 @@
 #include <proto/asl.h>
 #include <proto/dos.h>
 
+
+#ifndef CMD_FORMAT
+#define CMD_FORMAT 9  // Comando per formattazione via trackdisk.device
+#endif
 #include <dos/dos.h>
 #include <dos/dosextens.h>
 
@@ -39,7 +43,7 @@
 #include <stdio.h>
 
 #define APP_NAME "FloppyTool"
-#define APP_VER  "v7"
+#define APP_VER  "v7s"
 
 /* ----- Base pointers ----- */
 struct IntuitionBase *IntuitionBase = NULL;
@@ -56,25 +60,25 @@ enum {
 
 /* ----- Window size & layout ----- */
 #define WIN_W  500
-#define WIN_H  248
+#define WIN_H 168
 
 /* Gadget row layout */
 #define GAD_LEFT   12
 #define GAD_W      110
 #define GAD_H      18
 #define GAD_GAP    12
-#define ROW1_Y     20
-#define ROW2_Y     (ROW1_Y + 22 + 10)
+#define ROW1_Y 10
+#define ROW2_Y (ROW1_Y + GAD_H + 8)
 
 /* ASCII banner area between rows and log */
-#define ASCII_Y    (ROW2_Y + GAD_H + 6)
-#define ASCII_H    24  /* 2–3 text lines */
+#define ASCII_Y (ROW2_Y + GAD_H + 10)
+#define ASCII_H 26  /* tight 3-line banner */
 
 /* Log, progress, status */
-#define LOG_Y       (ASCII_Y + ASCII_H + 6)
-#define LOG_H       52  /* ~4 lines */
-#define PROGRESS_Y  (WIN_H - 64)
-#define STATUS_Y    (WIN_H - 24)
+#define LOG_Y (ASCII_Y + ASCII_H + 4)
+#define LOG_H       28  /* 2 lines */  /* ~4 lines */
+#define PROGRESS_Y  (LOG_Y + LOG_H + 4)
+#define STATUS_Y    (PROGRESS_Y + 22)
 
 /* Floppy geometry (DD) */
 #define CYLINDERS   80
@@ -101,11 +105,19 @@ struct AppUI {
   struct Gadget *gadVerifyADF;
   struct Gadget *gadAbout;
 
-  char logbuf[4][120];
+  char logbuf[2][120];
   int  logcount;
 } ui;
 
+/* Last drawn status/progress */
+static char  gStatus[128] = "";
+static ULONG gProgDone = 0, gProgTotal = 0;
+
+
 /* ----- Prototypes ----- */
+static void RedrawAll(void);
+static void PumpRefresh(void);
+
 static void CloseAll(void);
 static BOOL OpenLibs(void);
 static BOOL OpenUI(void);
@@ -129,7 +141,8 @@ static void DoVerifyADF(void);
 static void DoAbout(void);
 
 static BOOL AskFloppyUnit(UBYTE *unitOut, CONST_STRPTR action);
-static BOOL AskFormatQuick(BOOL *quickOut);
+typedef enum { FMT_CANCEL=0, FMT_QUICK_OS=1, FMT_FULL_OS=2, FMT_DEEP=3 } FormatMode;
+static FormatMode AskFormatMode(void);
 static BOOL AskVolumeName(char *outName, int maxlen, CONST_STRPTR defName);
 
 /* ASL helpers (used by Write/Verify ADF) */
@@ -198,8 +211,7 @@ int main(void) {
 
           case IDCMP_REFRESHWINDOW:
             GT_BeginRefresh(ui.win);
-            DrawAsciiBanner();
-            DrawLog();
+            RedrawAll();
             GT_EndRefresh(ui.win, TRUE);
             break;
 
@@ -340,14 +352,15 @@ static BOOL OpenUI(void) {
 }
 
 static void DrawStatus(const char *msg) {
-  if (!ui.win || !msg) return;
+  if (!ui.win) return;
+  if (msg) { strncpy(gStatus, msg, sizeof(gStatus)-1); gStatus[sizeof(gStatus)-1]='\0'; }
   struct RastPort *rp = ui.win->RPort;
   const WORD x = 12;
   const WORD y = STATUS_Y;
   const WORD w = WIN_W - 24;
-  const WORD h = 16;
+  const WORD h = 14;
   SetAPen(rp, 0);
-  RectFill(rp, x-2, y-12, x-2 + w, y-12 + h + 6);
+  RectFill(rp, x-2, y-12, x-2 + w, y-12 + h + 4);
   SetAPen(rp, 1);
   Move(rp, x, y);
   Text(rp, (STRPTR)msg, (ULONG)strlen(msg));
@@ -362,6 +375,7 @@ static void DrawFrame(struct RastPort *rp, WORD x, WORD y, WORD w, WORD h) {
 }
 
 static void DrawProgress(ULONG done, ULONG total) {
+  gProgDone = done; gProgTotal = total;
   if (!ui.win) return;
   struct RastPort *rp = ui.win->RPort;
   WORD x = 12, y = PROGRESS_Y, w = WIN_W - 24, h = 12;
@@ -390,86 +404,109 @@ static void DrawLog(void) {
   SetAPen(rp, 0);
   RectFill(rp, x, y, x+w, y+h);
   SetAPen(rp, 1);
-  for (int i=0;i<ui.logcount;i++) {
-    Move(rp, x+4, y+14 + 12*i);
+  int lines = ui.logcount; if (lines > 2) lines = 2;
+  for (int i=0;i<lines;i++) {
+    Move(rp, x+4, y+12 + 12*i);  /* slightly tighter baseline */
     Text(rp, (STRPTR)ui.logbuf[i], (ULONG)strlen(ui.logbuf[i]));
   }
   DrawFrame(rp, x, y, w, h);
 }
 
-/* ====== ASCII banner (2–3 text lines across width) ====== */
+/* ====== ASCII banner (3 lines: pattern + title + pattern) ====== */
 static void DrawAsciiBanner(void) {
   if (!ui.win) return;
   struct RastPort *rp = ui.win->RPort;
   WORD x = 12, w = WIN_W - 24;
-  WORD y0 = ASCII_Y;
-  WORD y1 = ASCII_Y + 12;
-  WORD y2 = ASCII_Y + 22;
 
-  /* clear area */
+  /* font metrics */
+  UWORD fh = (UWORD)(rp->Font ? rp->Font->tf_YSize : 8);
+  UWORD bl = (UWORD)(rp->Font ? rp->Font->tf_Baseline : 7);
+  WORD topBase    = ASCII_Y + (WORD)bl + 1;        /* 1px margin on top */
+  WORD titleBase  = topBase + (WORD)fh;            /* line 2 */
+  WORD bottomBase = titleBase + (WORD)fh;
+
+  /* white background */
+  SetAPen(rp, 1); RectFill(rp, x, ASCII_Y, x+w, ASCII_Y + ASCII_H);
+
+  /* top pattern */
+  const char *top = "/\\=/\\=--==/\\=/\\=--==";
+  ULONG topw = TextLength(rp, (STRPTR)top, (ULONG)strlen(top));
   SetAPen(rp, 0);
-  RectFill(rp, x, ASCII_Y, x+w, ASCII_Y + ASCII_H);
-
-  /* helper: repeat a small pattern across width */
-  const char *p1 = "=-";
-  const char *p2 = "-=";
-  ULONG p1w = TextLength(rp, (STRPTR)p1, (ULONG)strlen(p1));
-  ULONG p2w = TextLength(rp, (STRPTR)p2, (ULONG)strlen(p2));
-
-  /* line 1 */
-  SetAPen(rp, 2);
   WORD cx = x;
   while (cx < x + w) {
-    Move(rp, cx, y0);
-    Text(rp, (STRPTR)p1, (ULONG)strlen(p1));
-    cx += (WORD)p1w;
+    Move(rp, cx, topBase);
+    Text(rp, (STRPTR)top, (ULONG)strlen(top));
+    cx += (WORD)topw;
   }
 
-  /* centered title line */
-  const char *title = "2025 - Danilo Savioni + Stella AI";
+  /* centered title */
+  const char *title = "FloppyTool - 2025 Danilo Savioni + Stella AI";
   ULONG tlw = TextLength(rp, (STRPTR)title, (ULONG)strlen(title));
-  WORD tx = x + (w - (WORD)tlw) / 2;
-  if (tx < x) tx = x;
-  SetDrMd(rp, JAM2);           /* draw fg+bg for readability */
-  SetAPen(rp, 0);              /* black text */
-  SetBPen(rp, 2);              /* light background under glyphs */
-  Move(rp, tx,   y1);
+  WORD tx = x + (w - (WORD)tlw) / 2; if (tx < x) tx = x;
+  SetDrMd(rp, JAM2);  SetAPen(rp, 0);  SetBPen(rp, 1);
+  Move(rp, tx, titleBase);
   Text(rp, (STRPTR)title, (ULONG)strlen(title));
   SetDrMd(rp, JAM1);
 
-  /* line 3 */
-  SetAPen(rp, 2);
+  /* bottom pattern */
+  const char *bot = "==/\\=/\\==--==/\\=/\\==";
+  ULONG botw = TextLength(rp, (STRPTR)bot, (ULONG)strlen(bot));
   cx = x;
   while (cx < x + w) {
-    Move(rp, cx, y2);
-    Text(rp, (STRPTR)p2, (ULONG)strlen(p2));
-    cx += (WORD)p2w;
+    Move(rp, cx, bottomBase);
+    Text(rp, (STRPTR)bot, (ULONG)strlen(bot));
+    cx += (WORD)botw;
   }
 }
 
 static void LogClear(void) {
   ui.logcount = 0;
-  for (int i=0;i<4;i++) ui.logbuf[i][0] = '\0';
+  for (int i=0;i<2;i++) ui.logbuf[i][0] = '\0';
   DrawLog();
 }
 
 static void LogAdd(const char *msg) {
   if (!msg) return;
-  if (ui.logcount < 4) {
+  if (ui.logcount < 2) {
     strncpy(ui.logbuf[ui.logcount], msg, sizeof(ui.logbuf[ui.logcount])-1);
     ui.logbuf[ui.logcount][sizeof(ui.logbuf[ui.logcount])-1] = '\0';
     ui.logcount++;
   } else {
-    for (int i=0;i<3;i++) {
-      strncpy(ui.logbuf[i], ui.logbuf[i+1], sizeof(ui.logbuf[i])-1);
-      ui.logbuf[i][sizeof(ui.logbuf[i])-1] = '\0';
-    }
-    strncpy(ui.logbuf[3], msg, sizeof(ui.logbuf[3])-1);
-    ui.logbuf[3][sizeof(ui.logbuf[3])-1] = '\0';
+    /* shift up: line1 becomes line0, append new on line1 */
+    strncpy(ui.logbuf[0], ui.logbuf[1], sizeof(ui.logbuf[0])-1);
+    ui.logbuf[0][sizeof(ui.logbuf[0])-1] = '\0';
+    strncpy(ui.logbuf[1], msg, sizeof(ui.logbuf[1])-1);
+    ui.logbuf[1][sizeof(ui.logbuf[1])-1] = '\0';
   }
   DrawLog();
 }
 
+
+/* ====== Redraw helpers ====== */
+static void RedrawAll(void) {
+  if (!ui.win) return;
+  DrawAsciiBanner();
+  DrawLog();
+  DrawProgress(gProgDone, gProgTotal);
+  if (gStatus[0]) DrawStatus(gStatus);
+}
+
+static void PumpRefresh(void) {
+  if (!ui.win) return;
+  struct IntuiMessage *imsg;
+  /* Drain refresh messages so overlaps from requesters are repainted */
+  while ((imsg = GT_GetIMsg(ui.win->UserPort)) != NULL) {
+    if (imsg->Class == IDCMP_REFRESHWINDOW) {
+      GT_ReplyIMsg(imsg);
+      GT_BeginRefresh(ui.win);
+      RedrawAll();
+      GT_EndRefresh(ui.win, TRUE);
+    } else {
+      /* Reply and ignore other events during long ops */
+      GT_ReplyIMsg(imsg);
+    }
+  }
+}
 /* ====== Simple dialogs ====== */
 
 static BOOL AskFloppyUnit(UBYTE *unitOut, CONST_STRPTR action) {
@@ -488,23 +525,25 @@ static BOOL AskFloppyUnit(UBYTE *unitOut, CONST_STRPTR action) {
   es.es_GadgetFormat = (UBYTE*)"DF0|DF1|DF2|DF3|Cancel";
 
   LONG sel = EasyRequestArgs(ui.win, &es, NULL, NULL);
+  PumpRefresh();
   if (sel == 0 || sel == 5) return FALSE;
   if (sel < 1 || sel > 4) return FALSE;
   *unitOut = (UBYTE)(sel - 1);
   return TRUE;
 }
 
-static BOOL AskFormatQuick(BOOL *quickOut) {
-  if (!quickOut) return FALSE;
-  *quickOut = TRUE;
+static FormatMode AskFormatMode(void) {
   static UBYTE title[] = APP_NAME " " APP_VER;
-  static UBYTE text[]  = "Choose format type";
-  static UBYTE gadgets[] = "Quick|Full|Cancel";
+  static UBYTE text[]  = "Choose format mode";
+  static UBYTE gadgets[] = "Quick (OS)|Full (OS)|Deep (RAW+Quick)|Cancel";
   struct EasyStruct es = { sizeof(struct EasyStruct), 0, title, text, gadgets };
   LONG sel = EasyRequestArgs(ui.win, &es, NULL, NULL);
-  if (sel == 0 || sel == 3) return FALSE;
-  *quickOut = (sel == 1) ? TRUE : FALSE;
-  return TRUE;
+  PumpRefresh();
+  if (sel == 0 || sel == 4) return FMT_CANCEL;
+  if (sel == 1) return FMT_QUICK_OS;
+  if (sel == 2) return FMT_FULL_OS;
+  if (sel == 3) return FMT_DEEP;
+  return FMT_CANCEL;
 }
 
 static BOOL AskVolumeName(char *outName, int maxlen, CONST_STRPTR defName) {
@@ -578,6 +617,7 @@ static BOOL ASL_OpenFile(char *outPath, int maxlen, CONST_STRPTR title, CONST_ST
   }
 
   FreeAslRequest(fr);
+  PumpRefresh();
   return ok;
 }
 
@@ -586,47 +626,66 @@ static BOOL ASL_OpenFile(char *outPath, int maxlen, CONST_STRPTR title, CONST_ST
 static void DoFormatFloppy(void) {
   UBYTE unit;
   if (!AskFloppyUnit(&unit, "FORMAT")) { DrawStatus("Format canceled."); return; }
-  BOOL quick = TRUE;
-  if (!AskFormatQuick(&quick)) { DrawStatus("Format canceled."); return; }
+  FormatMode mode = AskFormatMode();
+  if (mode == FMT_CANCEL) { DrawStatus("Format canceled."); return; }
 
-  char volname[32]; if (!AskVolumeName(volname, sizeof(volname), "Untitled")) { DrawStatus("Format canceled."); return; }
+  char volname[32];
+  if (!AskVolumeName(volname, sizeof(volname), "Untitled")) { DrawStatus("Format canceled."); return; }
 
   const char *candidates[] = { "C:Format", "SYS:C/Format", NULL };
   const char *fmt = NULL;
   for (int i=0; candidates[i]; ++i) { if (HasFile(candidates[i])) { fmt = candidates[i]; break; } }
   if (!fmt) { DrawStatus("No Format in C: (install Workbench C:Format)."); return; }
 
-  {
-    char cmd[256];
-    sprintf(cmd, "%s DRIVE DF%u: NAME \"%s\" QUICK", fmt, (unsigned)unit, volname);
+  LogClear();
 
-    BPTR inTmp = Open("T:ft_yes", MODE_NEWFILE);
-    if (inTmp) { Write(inTmp, (APTR)"y\n", 2); Close(inTmp); }
+  if (mode == FMT_QUICK_OS) {
+    char cmd[256]; sprintf(cmd, "%s DRIVE DF%u: NAME \"%s\" QUICK", fmt, (unsigned)unit, volname);
+    DrawStatus("Quick format (OS)...");
+    BPTR inTmp = Open("T:ft_yes", MODE_NEWFILE); if (inTmp) { Write(inTmp, (APTR)"y\n", 2); Close(inTmp); }
     BPTR in  = Open("T:ft_yes", MODE_OLDFILE);
     BPTR out = Open("NIL:", MODE_NEWFILE);
-
-    LogClear(); LogAdd("Running C:Format QUICK");
-    DrawStatus("Quick format...");
     LONG ok = Execute((STRPTR)cmd, in ? in : Open("NIL:", MODE_OLDFILE), out);
-    if (in) Close(in);
-    if (out) Close(out);
-    DeleteFile("T:ft_yes");
-
-    if (!ok) { SetFloppyMotor(unit, FALSE); DrawStatus("Format failed."); ClearProgress(); return; }
+    if (in) Close(in); if (out) Close(out); DeleteFile("T:ft_yes");
+    SetFloppyMotor(unit, FALSE);
+    DrawStatus(ok ? "Quick format done." : "Quick format failed.");
+    ClearProgress();
+    return;
   }
 
-  if (!quick) {
-    DrawStatus("Full format: writing tracks...");
+  if (mode == FMT_FULL_OS) {
+    char cmd[256]; sprintf(cmd, "%s DRIVE DF%u: NAME \"%s\"", fmt, (unsigned)unit, volname);
+    DrawStatus("Full format (OS)...");
+    BPTR inTmp = Open("T:ft_yes", MODE_NEWFILE); if (inTmp) { Write(inTmp, (APTR)"y\n", 2); Close(inTmp); }
+    BPTR in  = Open("T:ft_yes", MODE_OLDFILE);
+    BPTR out = Open("NIL:", MODE_NEWFILE);
+    LONG ok = Execute((STRPTR)cmd, in ? in : Open("NIL:", MODE_OLDFILE), out);
+    if (in) Close(in); if (out) Close(out); DeleteFile("T:ft_yes");
+    SetFloppyMotor(unit, FALSE);
+    DrawStatus(ok ? "Full format done." : "Full format failed.");
     ClearProgress();
-    LogClear();
+    return;
+  }
+
+  if (mode == FMT_DEEP) {
+    DrawStatus("Deep format: RAW pass...");
+    ClearProgress();
     BOOL passOk = RawWritePass(unit);
     SetFloppyMotor(unit, FALSE);
-    DrawStatus(passOk ? "Full format done." : "Full format failed.");
-    ClearProgress();
-  } else {
+    if (!passOk) { DrawStatus("RAW pass failed."); ClearProgress(); return; }
+
+    /* Now install filesystem quickly */
+    char cmd2[256]; sprintf(cmd2, "%s DRIVE DF%u: NAME \"%s\" QUICK", fmt, (unsigned)unit, volname);
+    DrawStatus("Installing filesystem (Quick)...");
+    BPTR inTmp = Open("T:ft_yes", MODE_NEWFILE); if (inTmp) { Write(inTmp, (APTR)"y\n", 2); Close(inTmp); }
+    BPTR in  = Open("T:ft_yes", MODE_OLDFILE);
+    BPTR out = Open("NIL:", MODE_NEWFILE);
+    LONG ok2 = Execute((STRPTR)cmd2, in ? in : Open("NIL:", MODE_OLDFILE), out);
+    if (in) Close(in); if (out) Close(out); DeleteFile("T:ft_yes");
     SetFloppyMotor(unit, FALSE);
-    DrawStatus("Quick format done.");
+    DrawStatus(ok2 ? "Deep format done." : "Deep format failed at OS stage.");
     ClearProgress();
+    return;
   }
 }
 
@@ -745,14 +804,15 @@ static void DoVerifyADF(void) {
 static void DoAbout(void) {
   static UBYTE title[] = APP_NAME " " APP_VER;
   static UBYTE text[]  =
-    "FloppyTool  Amiga DD floppy helper\n"
+    "FloppyTool – Amiga DD floppy helper\n"
     "\n"
     "Features:\n"
-    "    Format/Verify/Copy raw\n"
-    "    Read/Write/Verify ADF\n"
+    "  • Format (Quick/Full/Deep)\n"
+    "  • Verify/Copy raw\n"
+    "  • Read/Write/Verify ADF\n"
     "\n"
-    "  2025 Danilo Savioni + Stella\n"
-    "Built with love for AmigaOS 2.0+ (68k)\n";
+    "© 2025 Danilo Savioni + Stella\n"
+    "Built for AmigaOS 2.0+ (68k)\n";
   static UBYTE gadgets[] = "OK";
   struct EasyStruct es = { sizeof(struct EasyStruct), 0, title, text, gadgets };
   EasyRequestArgs(ui.win, &es, NULL, NULL);
@@ -799,26 +859,100 @@ static BOOL RawWritePass(UBYTE unit) {
   SetFloppyMotor(unit, TRUE);
 
   UBYTE *buf = (UBYTE*)AllocVec(TRACK_SIZE, MEMF_CLEAR);
-  if (!buf) { CloseTD(p, io); return FALSE; }
+  UBYTE *verifyBuf = (UBYTE*)AllocVec(TRACK_SIZE, MEMF_CLEAR);
+  if (!buf || !verifyBuf) {
+    if (buf) FreeVec(buf);
+    if (verifyBuf) FreeVec(verifyBuf);
+    CloseTD(p, io);
+    return FALSE;
+  }
   memset(buf, 0, TRACK_SIZE);
 
   BOOL ok = TRUE;
   for (ULONG t=0; t<TRACKS; ++t) {
-    io->iotd_Req.io_Command = CMD_WRITE;
-    io->iotd_Req.io_Data    = (APTR)buf;
+    int maxRetry = (t == 0) ? 5 : 2;  // More retries on track 0
+    BOOL success = FALSE;
+
+    if (t == 0) {
+      // Pre-scrub with pattern A5
+      memset(buf, 0xA5, TRACK_SIZE);
+      io->iotd_Req.io_Command = CMD_WRITE;
+      io->iotd_Req.io_Data    = (APTR)buf;
+      io->iotd_Req.io_Length  = TRACK_SIZE;
+      io->iotd_Req.io_Offset  = 0;
+      DoIO((struct IORequest*)io); // Ignore result
+
+      // Pre-scrub with pattern 00
+      memset(buf, 0x00, TRACK_SIZE);
+      io->iotd_Req.io_Command = CMD_WRITE;
+      io->iotd_Req.io_Data    = (APTR)buf;
+      io->iotd_Req.io_Length  = TRACK_SIZE;
+      io->iotd_Req.io_Offset  = 0;
+      DoIO((struct IORequest*)io); // Ignore result
+    }
+
+    while (maxRetry-- > 0 && !success) {
+
+    // Try CMD_FORMAT if supported
+    io->iotd_Req.io_Command = CMD_FORMAT;
+    io->iotd_Req.io_Data    = (APTR)NULL;
     io->iotd_Req.io_Length  = TRACK_SIZE;
     io->iotd_Req.io_Offset  = t * TRACK_SIZE;
-    if (DoIO((struct IORequest*)io) != 0) {
-      ok = FALSE;
-      char m[80]; sprintf(m, "Write error at track %lu (io_Error=%ld)", (unsigned long)t, (long)io->iotd_Req.io_Error);
-      LogAdd(m);
-      break;
+    if (DoIO((struct IORequest*)io) == 0) {
+      // Format success, now verify
+      io->iotd_Req.io_Command = CMD_READ;
+      io->iotd_Req.io_Data    = (APTR)verifyBuf;
+      io->iotd_Req.io_Length  = TRACK_SIZE;
+      io->iotd_Req.io_Offset  = t * TRACK_SIZE;
+      if (DoIO((struct IORequest*)io) == 0 &&
+          memcmp(buf, verifyBuf, TRACK_SIZE) == 0) {
+        success = TRUE;
+        goto track_done;
+      } else {
+        LogAdd("CMD_FORMAT verify failed; fallback to CMD_WRITE.");
+      }
+    } else {
+      LogAdd("CMD_FORMAT failed; fallback to CMD_WRITE.");
     }
+
+      io->iotd_Req.io_Command = CMD_WRITE;
+      io->iotd_Req.io_Data    = (APTR)buf;
+      io->iotd_Req.io_Length  = TRACK_SIZE;
+      io->iotd_Req.io_Offset  = t * TRACK_SIZE;
+      if (DoIO((struct IORequest*)io) == 0) {
+        // Verify immediately after write
+        io->iotd_Req.io_Command = CMD_READ;
+        io->iotd_Req.io_Data    = (APTR)verifyBuf;
+        io->iotd_Req.io_Length  = TRACK_SIZE;
+        io->iotd_Req.io_Offset  = t * TRACK_SIZE;
+        if (DoIO((struct IORequest*)io) == 0 &&
+            memcmp(buf, verifyBuf, TRACK_SIZE) == 0) {
+          success = TRUE;
+        } else {
+          LogAdd("Verify failed after write.");
+        }
+      } else {
+        LogAdd("Write failed, retrying...");
+      }
+      WaitTOF();
+    }
+
+    if (!success) {
+      char m[80]; sprintf(m, "Track %lu failed after retries.", (unsigned long)t);
+      LogAdd(m);
+      // Don't abort; continue with next track (format even if error)
+    }
+
+    track_done:
     DrawProgress(t+1, TRACKS);
-    if ((t % 4) == 0 || t == TRACKS-1) { char m[64]; sprintf(m, "Wrote track %lu/%u", (unsigned long)(t+1), TRACKS); LogAdd(m); }
+    if ((t % 4) == 0 || t == TRACKS-1) {
+      char m[64]; sprintf(m, "Track %lu/%u", (unsigned long)(t+1), TRACKS);
+      LogAdd(m);
+    }
   }
 
   FreeVec(buf);
+  FreeVec(verifyBuf);
   CloseTD(p, io);
   return ok;
 }
@@ -927,6 +1061,7 @@ static BOOL RawCopyOneDrive(UBYTE unit) {
                            (UBYTE*)"Insert DESTINATION disk and click Continue",
                            (UBYTE*)"Continue|Cancel" };
   LONG sel = EasyRequestArgs(ui.win, &es, NULL, NULL);
+  PumpRefresh();
   if (sel != 1) goto cleanup;
 
   DrawStatus("Writing RAM image to destination...");
